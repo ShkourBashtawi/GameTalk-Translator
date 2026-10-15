@@ -1,0 +1,444 @@
+import json
+
+import httpx
+import numpy as np
+import pytest
+from test_translate import AUDIO, SPEECH, FakeBackend, FakeCloud
+
+from gametalk.config import GOOGLE, Settings, settings_from_dict, validate
+from gametalk.google import (
+    GoogleClient,
+    GoogleCredentials,
+    GoogleError,
+    billed_chars,
+    check_connection,
+)
+from gametalk.translate import (
+    PipelineError,
+    TeamRequest,
+    TranslationRequest,
+    run_pipeline,
+    run_team_pipeline,
+    run_text_pipeline,
+)
+
+NMT = GoogleCredentials("gk")
+LLM = GoogleCredentials("gk", project_id="my-proj", model="llm")
+
+
+def reply(text="Stay behind me"):
+    return httpx.Response(200, json={"data": {"translations": [{"translatedText": text}]}})
+
+
+def client_with(handler, creds=NMT):
+    return GoogleClient(creds, transport=httpx.MockTransport(handler))
+
+
+def test_translate_request_shape_and_key_stays_out_of_the_url():
+    seen = {}
+
+    def handler(request: httpx.Request):
+        seen["url"] = str(request.url)
+        seen["headers"] = request.headers
+        seen["body"] = json.loads(request.content)
+        return reply("Stay behind me &amp; cover")
+
+    out = client_with(handler).translate("خليكم وراي", "ar", "zh-Hans")
+    assert out == "Stay behind me & cover"  # HTML entities decoded
+    assert "gk" not in seen["url"] and "key=" not in seen["url"]
+    assert seen["headers"]["X-goog-api-key"] == "gk"
+    assert seen["body"] == {
+        "q": ["خليكم وراي"],
+        "target": "zh-CN",  # our code -> Google's
+        "source": "ar",
+        "format": "text",
+        "model": "nmt",
+    }
+
+
+def test_llm_model_uses_project_resource_name():
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return reply()
+
+    client_with(handler, LLM).translate("خليكم وراي", None, "en")
+    assert seen["body"]["model"] == (
+        "projects/my-proj/locations/us-central1/models/general/translation-llm"
+    )
+    assert "source" not in seen["body"]  # auto-detect
+
+
+def test_llm_without_project_id_is_a_friendly_error():
+    creds = GoogleCredentials("gk", model="llm")
+    assert not creds.ready
+    with pytest.raises(GoogleError, match="project ID"):
+        client_with(lambda r: reply(), creds).translate("x", "ar", "en")
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        (400, {"error": {"message": "API key not valid. Please pass a valid API key."}}, "valid"),
+        (403, {"error": {"message": "This API method requires billing to be enabled."}}, "billing"),
+        (
+            403,
+            {"error": {"message": "Cloud Translation API has not been used in project 1"}},
+            "enable",
+        ),
+        (429, {"error": {"message": "Quota exceeded"}}, "quota"),
+        (500, {}, "HTTP 500"),
+    ],
+)
+def test_errors_are_explained(status, body, expected):
+    c = client_with(lambda r: httpx.Response(status, json=body))
+    with pytest.raises(GoogleError, match=expected):
+        c.translate("x", "ar", "en")
+
+
+def test_repr_never_shows_the_key():
+    assert "gk" not in repr(NMT) and "gk" not in repr(LLM)
+
+
+def test_billing_counts_output_only_for_llm():
+    assert billed_chars(NMT, "abcd", "xy") == 4
+    assert billed_chars(LLM, "abcd", "xy") == 6
+
+
+def test_check_connection():
+    assert check_connection(GoogleCredentials())[0][0] is False
+    ok = check_connection(NMT, transport=httpx.MockTransport(lambda r: reply("Hello")))
+    assert ok == [(True, "Google Translate: connected (مرحبا → Hello)")]
+
+
+class FakeGoogle(FakeCloud):
+    def __init__(self, translated="Stay behind me", creds=NMT):
+        super().__init__(translated=translated)
+        self.creds = creds
+
+
+def test_whisper_then_google_sends_only_text():
+    backend = FakeBackend({"transcribe": " خليكم وراي "})
+    google, azure = FakeGoogle(), FakeCloud()
+    req = TranslationRequest(language="ar", translation_provider=GOOGLE)
+    result = run_pipeline(AUDIO, req, backend, azure, google=google)
+    assert result.text == "Stay behind me."
+    assert google.calls == [("translate", "خليكم وراي", "ar", "en")]
+    assert azure.calls == []
+    assert result.google_chars == len("خليكم وراي") and result.azure_chars == 0
+
+
+def test_azure_speech_then_google():
+    google, azure = FakeGoogle(translated="Wait for me"), FakeCloud()
+    req = TranslationRequest(
+        language="ar", speech_provider="azure", translation_provider=GOOGLE, azure_locale="ar-JO"
+    )
+    result = run_pipeline(SPEECH, req, None, azure, google=google)
+    assert result.text == "Wait for me."
+    assert azure.calls == [("recognize", "ar-JO")]
+    assert google.calls[0][0] == "translate"
+
+
+def test_google_route_without_key_is_a_friendly_error():
+    req = TranslationRequest(language="ar", translation_provider=GOOGLE)
+    with pytest.raises(PipelineError, match="Google"):
+        run_pipeline(AUDIO, req, FakeBackend({"transcribe": "x"}), None)
+
+
+def test_text_and_team_pipelines_use_google():
+    google = FakeGoogle(translated="Stay behind me", creds=LLM)
+    req = TranslationRequest(language="ar")
+    r = run_text_pipeline("خليكم وراي", req, "google", None, None, google=google)
+    assert r.text == "Stay behind me."
+    assert r.google_chars == len("خليكم وراي") + len("Stay behind me")  # LLM: in + out
+    team = run_team_pipeline(
+        AUDIO,
+        TeamRequest(translator=GOOGLE, target_language="ar"),
+        FakeBackend({"transcribe": "Push B now"}),
+        None,
+        None,
+        google=FakeGoogle(translated="ادفعوا على B"),
+    )
+    assert team.text == "ادفعوا على B" and team.google_chars == len("Push B now")
+
+
+def test_config_keeps_azure_speech_with_google_translation():
+    s = Settings()
+    s.profile.speech_provider = "azure"
+    s.profile.translation_provider = GOOGLE
+    s.profile.target_language = "fr"
+    s.google.model = "bogus"
+    s.google.project_id = " my proj "
+    validate(s)
+    assert s.profile.translation_provider == GOOGLE
+    assert s.profile.target_language == "fr"  # Google can translate to any listed language
+    assert s.google.model == "nmt" and s.google.project_id == "myproj"
+    assert s.profile.uses_google and s.profile.uses_azure
+
+
+def test_old_config_without_google_section_loads():
+    s = settings_from_dict({"profiles": [{"name": "Default"}]})
+    assert s.google.api_key == "" and s.google.model == "nmt"
+
+
+def test_usage_counts_google_separately(tmp_path):
+    from gametalk.usage import GOOGLE_FREE_CHARS, UsageTracker
+
+    u = UsageTracker(tmp_path / "usage.json")
+    assert u.add(google_chars=int(GOOGLE_FREE_CHARS * 0.85)) == ["google:0.8"]
+    assert u.current.translator_chars == 0
+
+
+def test_quick_text_auto_prefers_the_profiles_google(qapp, tmp_path):
+    from factory import make_controller
+
+    from gametalk.credentials import protect
+
+    c = make_controller(tmp_path)
+    assert c._text_translator() == "local"  # no keys at all
+    c.settings.google.api_key = protect("gk")
+    assert c._text_translator() == GOOGLE  # the only cloud key
+    c.settings.azure.translator_key = protect("tk")
+    c._creds_cache = None
+    assert c._text_translator() == "azure"  # both: Azure unless the profile uses Google
+    c.profile.translation_provider = GOOGLE
+    assert c._text_translator() == GOOGLE
+
+
+def test_send_audio_attaches_google_credentials(qapp, tmp_path):
+    from factory import make_controller
+
+    from gametalk.credentials import protect
+
+    c = make_controller(tmp_path)
+    c.settings.google.api_key = protect("gk")
+    c.profile.translation_provider = GOOGLE
+    c._send_audio(np.zeros(16000, np.float32), "ptt")
+    job = c.speech.jobs[-1]
+    assert job.google is not None and job.google.api_key == "gk"
+    assert job.azure is None
+
+
+# ---------------------------------------------------------------- Chirp 3 (speech)
+
+CHIRP = GoogleCredentials("gk", project_id="my-proj")
+
+
+def test_chirp_request_shape_and_result():
+    import base64
+
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["key"] = request.headers["X-goog-api-key"]
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"alternatives": [{"transcript": " خليكم "}]},
+                    {"alternatives": [{"transcript": "وراي"}]},
+                ]
+            },
+        )
+
+    text = client_with(handler, CHIRP).recognize(
+        np.zeros(1600, np.float32), "ar-JO", phrases=("Medic", "Flank")
+    )
+    assert text == "خليكم وراي"
+    assert seen["url"] == (
+        "https://us-speech.googleapis.com/v2/projects/my-proj/locations/us/recognizers/_:recognize"
+    )
+    assert seen["key"] == "gk" and "gk" not in seen["url"]
+    cfg = seen["body"]["config"]
+    assert cfg["model"] == "chirp_3" and cfg["languageCodes"] == ["ar-JO"]
+    assert cfg["denoiserConfig"]["denoiseAudio"] is True
+    phrases = cfg["adaptation"]["phraseSets"][0]["inlinePhraseSet"]["phrases"]
+    assert [p["value"] for p in phrases] == ["Medic", "Flank"]
+    assert base64.b64decode(seen["body"]["content"])[:4] == b"RIFF"
+
+
+def test_chirp_locale_fallback_and_options():
+    from gametalk.google import chirp_locale
+
+    assert chirp_locale("ar-PS") == "ar-PS"
+    assert chirp_locale("ar-IQ") == "ar-XA"  # not in Chirp 3's list: generic Arabic
+    seen = {}
+
+    def handler(request):
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={})  # nothing heard
+
+    quiet = GoogleCredentials("gk", project_id="p", denoise=False)
+    assert client_with(handler, quiet).recognize(np.zeros(160, np.float32), "ar-SA") == ""
+    assert "denoiserConfig" not in seen["body"]["config"]
+    assert "adaptation" not in seen["body"]["config"]
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "expected"),
+    [
+        (401, "API keys are not supported by this API. Expected OAuth2 access token", "service"),
+        (403, "Cloud Speech-to-Text API has not been used in project 1", "enable"),
+        (400, "The language ar-XX is not supported", "dialect"),
+    ],
+)
+def test_chirp_errors_are_explained(status, message, expected):
+    c = client_with(lambda r: httpx.Response(status, json={"error": {"message": message}}), CHIRP)
+    with pytest.raises(GoogleError, match=expected):
+        c.recognize(np.zeros(160, np.float32), "ar-JO")
+
+
+def test_chirp_needs_project_id():
+    with pytest.raises(GoogleError, match="project ID"):
+        client_with(lambda r: reply(), NMT).recognize(np.zeros(160, np.float32), "ar-JO")
+
+
+def test_chirp_then_google_translate_with_stage_timings():
+    class FakeChirp(FakeGoogle):
+        def recognize(self, audio, locale, phrases=()):
+            self.calls.append(("recognize", locale, phrases))
+            return "خليكم وراي"
+
+    g = FakeChirp(translated="Stay behind me")
+    req = TranslationRequest(
+        language="ar",
+        speech_provider=GOOGLE,
+        translation_provider=GOOGLE,
+        azure_locale="ar-JO",
+        phrases=("Medic",),
+    )
+    result = run_pipeline(SPEECH, req, None, None, google=g)
+    assert result.text == "Stay behind me."
+    assert g.calls[0] == ("recognize", "ar-JO", ("Medic",))
+    assert result.google_speech_seconds > 0
+    assert set(result.timings) == {"speech", "translate"}
+
+
+def test_config_google_speech_forces_a_text_translator():
+    s = Settings()
+    s.profile.speech_provider = GOOGLE
+    s.profile.translation_provider = "whisper-local"
+    validate(s)
+    assert s.profile.translation_provider == GOOGLE  # Whisper can't translate text
+    assert s.profile.uses_google and not s.profile.uses_whisper
+
+
+def test_check_connection_can_include_chirp():
+    def handler(request):
+        if "speech" in str(request.url):
+            return httpx.Response(200, json={})
+        return reply("Hello")
+
+    out = check_connection(CHIRP, transport=httpx.MockTransport(handler), speech=True)
+    assert out[0][0] and out[1][0] and out[1][1].startswith("Google Chirp 3: connected (")
+
+
+# ---------------------------------------------------------------- Chirp 3 service-account login
+
+
+def _service_account():
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    account = {
+        "type": "service_account",
+        "project_id": "cogent-test-1",
+        "private_key_id": "abc",
+        "private_key": pem,
+        "client_email": "gametalk@cogent-test-1.iam.gserviceaccount.com",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+    return key, json.dumps(account)
+
+
+def test_signed_jwt_is_a_valid_rs256_token():
+    import base64
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    from gametalk.google import parse_service_account, signed_jwt
+
+    key, text = _service_account()
+    token = signed_jwt(parse_service_account(text), now=1000)
+    head, claims, sig = token.split(".")
+
+    def unb64(part):
+        return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+    assert json.loads(unb64(head)) == {"alg": "RS256", "typ": "JWT", "kid": "abc"}
+    c = json.loads(unb64(claims))
+    assert c["iss"].startswith("gametalk@") and c["iat"] == 1000 and c["exp"] == 4600
+    assert c["scope"] == "https://www.googleapis.com/auth/cloud-platform"
+    key.public_key().verify(  # raises if the signature is wrong
+        unb64(sig), f"{head}.{claims}".encode(), padding.PKCS1v15(), hashes.SHA256()
+    )
+
+
+def test_bad_service_account_files_are_rejected():
+    from gametalk.google import parse_service_account
+
+    for bad in ("nope", '{"type": "authorized_user"}', '{"type": "service_account"}'):
+        with pytest.raises(ValueError):
+            parse_service_account(bad)
+
+
+def test_chirp_uses_a_cached_bearer_token_from_the_service_account():
+    _, text = _service_account()
+    creds = GoogleCredentials(project_id="cogent-test-1", service_account=text)
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if "oauth2" in str(request.url):
+            assert b"jwt-bearer" in request.content
+            return httpx.Response(200, json={"access_token": "tok-1", "expires_in": 3600})
+        assert request.headers["Authorization"] == "Bearer tok-1"
+        assert "X-goog-api-key" not in request.headers
+        return httpx.Response(200, json={"results": [{"alternatives": [{"transcript": "هلق"}]}]})
+
+    c = client_with(handler, creds)
+    assert c.recognize(np.zeros(160, np.float32), "ar-JO") == "هلق"
+    assert c.recognize(np.zeros(160, np.float32), "ar-JO") == "هلق"
+    assert sum("oauth2" in u for u in calls) == 1  # one login for many sentences
+
+
+def test_refused_service_account_is_explained():
+    _, text = _service_account()
+    creds = GoogleCredentials(project_id="p", service_account=text)
+    c = client_with(lambda r: httpx.Response(400, json={"error": "invalid_grant"}), creds)
+    with pytest.raises(GoogleError, match="refused"):
+        c.recognize(np.zeros(160, np.float32), "ar-JO")
+
+
+def test_hub_loads_the_service_account_encrypted(qapp, tmp_path):
+    from factory import make_controller
+
+    from gametalk.credentials import unprotect
+    from gametalk.hub.backend import Hub
+
+    _, text = _service_account()
+    path = tmp_path / "sa.json"
+    path.write_text(text, encoding="utf-8")
+    c = make_controller(tmp_path)
+    hub = Hub(c, poll=False)
+    assert hub.loadServiceAccountFrom(str(path))
+    raw = c.store.path.read_text(encoding="utf-8")
+    assert "PRIVATE KEY" not in raw  # only DPAPI ciphertext on disk
+    assert unprotect(c.settings.google.service_account) == text
+    assert c.settings.google.project_id == "cogent-test-1"  # filled in from the file
+    assert hub.config["google"]["service_account"] is True
+    assert c.google_credentials().speech_ready
+    bad = tmp_path / "bad.json"
+    bad.write_text("{}", encoding="utf-8")
+    assert not hub.loadServiceAccountFrom(str(bad))
+    hub.close()
